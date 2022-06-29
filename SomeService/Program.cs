@@ -17,7 +17,7 @@ public static class Program
     private static readonly ConsumerConfig ConsumerConfig = new()
     {
         BootstrapServers = KafkaHost, 
-        GroupId = "Group_2", 
+        GroupId = "Group_3", 
         AutoOffsetReset = AutoOffsetReset.Earliest, 
         EnableAutoCommit = false
     };
@@ -56,8 +56,10 @@ public static class Program
         // await ProduceMessages(cancellationToken);
         
         var consumer1Task = Task.Run(async () => await ConsumeMessages(1, cancellationToken));
+        var consumer2Task = Task.Run(async () => await ConsumeMessages(2, cancellationToken));
+        var consumer3Task = Task.Run(async () => await ConsumeMessages(3, cancellationToken));
 
-        await consumer1Task;
+        await Task.WhenAll(consumer1Task, consumer2Task, consumer3Task);
         Console.ReadLine();
     }
 
@@ -122,7 +124,7 @@ public static class Program
             {
                 try
                 {
-                    ProcessMessage(messages.ToImmutableArray(), redisDb);
+                    ProcessMessage(messages.ToImmutableArray(), redisDb, consumerNumber);
                 
                     consumer.Commit(messages.Select(p => p.topicPartitionOffset));
                         
@@ -131,7 +133,7 @@ public static class Program
                 }
                 catch(Exception ex)
                 {
-                    Console.WriteLine($"[Error] ::: Batch processing message failure. BatchMessageFirst:{messages.First().topicPartitionOffset}, BatchMessageLast:{messages.Last().topicPartitionOffset}. Error: {ex.Message}");
+                    Console.WriteLine($"[Error] ::: ConsumerNumber: {consumerNumber} | Batch processing message failure. BatchMessageFirst:{messages.First().topicPartitionOffset}, BatchMessageLast:{messages.Last().topicPartitionOffset}. Error: {ex.Message}");
                     await Task.Delay(FailDelay);
                     continue;
                 }
@@ -147,14 +149,14 @@ public static class Program
                 {
                     messages.Enqueue((message.TopicPartitionOffset, message.Message));
                     
-                    Console.WriteLine($"[Info] --> Consume {message.TopicPartitionOffset} => key : {message.Message.Key}, value: {{ {message.Message.Value.Name} : {message.Message.Value.Age} }} => InBatchPosition: {messages.Count}");
+                    Console.WriteLine($"[Info] --> ConsumerNumber: {consumerNumber} | Consume {message.TopicPartitionOffset} => key : {message.Message.Key}, value: {{ {message.Message.Value.Name} : {message.Message.Value.Age} }} => InBatchPosition: {messages.Count}");
 
                     lastProcessedIsSuccessfully = true;
                 }
             }
             catch(Exception ex)
             {
-                Console.WriteLine($"[Error] ::: consume messages error ({message.Topic}:{message.Partition}:{message.Offset}): {ex.Message}");
+                Console.WriteLine($"[Error] ::: ConsumerNumber: {consumerNumber} | consume messages error ({message.Topic}:{message.Partition}:{message.Offset}): {ex.Message}");
                 lastProcessedIsSuccessfully = false;
             }
 
@@ -165,21 +167,21 @@ public static class Program
         consumer.Close();
     }
 
-    private static void ProcessMessage<TKey, TValue>(IReadOnlyCollection<(TopicPartitionOffset, Message<TKey, TValue>)> messages, IDatabase redis)
+    private static void ProcessMessage<TKey, TValue>(IReadOnlyCollection<(TopicPartitionOffset, Message<TKey, TValue>)> messages, IDatabase redis, int consumerNumber)
     {
         foreach(var message in messages)
         {
             var redisValue = redis.StringGet(message.Item1.ToString());
             if(!redisValue.IsNullOrEmpty)
             {
-                Console.WriteLine($"[INFO] --> redis already has TopicPartitionOffset: {message.Item1} => this message is processed already.");
+                Console.WriteLine($"[INFO] --> ConsumerNumber: {consumerNumber} | redis already has TopicPartitionOffset: {message.Item1} => this message is processed already.");
                 continue;
             }
 
             // Processing logic
-            Console.WriteLine($"[Info] --> process {message.Item1.ToString()}");
+            Console.WriteLine($"[Info] --> ConsumerNumber: {consumerNumber} | process {message.Item1.ToString()}");
             if(Random.Next(10) % 9 == 0)
-                throw new Exception("Random custom error");
+                throw new Exception("ConsumerNumber: {consumerNumber} | Random custom error");
 
             redis.StringSet(key: message.Item1.ToString(), value: true);
         }
