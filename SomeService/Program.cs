@@ -1,6 +1,7 @@
-﻿using System.Collections.Immutable;
+using System.Collections.Immutable;
 using System.Text.Json;
 using Confluent.Kafka;
+using SomeService.Models;
 using StackExchange.Redis;
 
 namespace SomeService;
@@ -115,7 +116,7 @@ public static class Program
         consumer.Subscribe(PersonTopic);
 
         var lastProcessedIsSuccessfully = true;
-        Queue<(TopicPartitionOffset topicPartitionOffset, Message<string, Person> message)> messages = new();
+        Queue<KafkaMessageWrap<string, Person>> messages = new();
         var deadline = DateTime.UtcNow.Add(LingerMs);
             
         while(!cancellationToken.IsCancellationRequested)
@@ -126,14 +127,14 @@ public static class Program
                 {
                     ProcessMessage(messages.ToImmutableArray(), redisDb, consumerNumber);
                 
-                    consumer.Commit(messages.Select(p => p.topicPartitionOffset));
+                    consumer.Commit(messages.Select(p => p.Id));
                         
                     messages.Clear();
                     deadline = DateTime.UtcNow.Add(LingerMs);
                 }
                 catch(Exception ex)
                 {
-                    Console.WriteLine($"[Error] ::: ConsumerNumber: {consumerNumber} | Batch processing message failure. BatchMessageFirst:{messages.First().topicPartitionOffset}, BatchMessageLast:{messages.Last().topicPartitionOffset}. Error: {ex.Message}");
+                    Console.WriteLine($"[Error] ::: ConsumerNumber: {consumerNumber} | Batch processing message failure. BatchMessageFirst:{messages.First().Id}, BatchMessageLast:{messages.Last().Id}. Error: {ex.Message}");
                     await Task.Delay(FailDelay);
                     continue;
                 }
@@ -147,7 +148,11 @@ public static class Program
             {
                 if(message != null)
                 {
-                    messages.Enqueue((message.TopicPartitionOffset, message.Message));
+                    messages.Enqueue(new KafkaMessageWrap<string, Person>
+                    {
+                        Id = message.TopicPartitionOffset, 
+                        Message = message.Message
+                    });
                     
                     Console.WriteLine($"[Info] --> ConsumerNumber: {consumerNumber} | Consume {message.TopicPartitionOffset} => key : {message.Message.Key}, value: {{ {message.Message.Value.Name} : {message.Message.Value.Age} }} => InBatchPosition: {messages.Count}");
 
@@ -167,23 +172,23 @@ public static class Program
         consumer.Close();
     }
 
-    private static void ProcessMessage<TKey, TValue>(IReadOnlyCollection<(TopicPartitionOffset, Message<TKey, TValue>)> messages, IDatabase redis, int consumerNumber)
+    private static void ProcessMessage<TKey, TValue>(IReadOnlyCollection<KafkaMessageWrap<TKey, TValue>> messages, IDatabase redis, int consumerNumber)
     {
         foreach(var message in messages)
         {
-            var redisValue = redis.StringGet(message.Item1.ToString());
+            var redisValue = redis.StringGet(message.Id.ToString());
             if(!redisValue.IsNullOrEmpty)
             {
-                Console.WriteLine($"[INFO] --> ConsumerNumber: {consumerNumber} | redis already has TopicPartitionOffset: {message.Item1} => this message is processed already.");
+                Console.WriteLine($"[INFO] --> ConsumerNumber: {consumerNumber} | redis already has TopicPartitionOffset: {message.Id} => this message is processed already.");
                 continue;
             }
 
             // Processing logic
-            Console.WriteLine($"[Info] --> ConsumerNumber: {consumerNumber} | process {message.Item1.ToString()}");
+            Console.WriteLine($"[Info] --> ConsumerNumber: {consumerNumber} | process {message.Id.ToString()}");
             if(Random.Next(10) % 9 == 0)
                 throw new Exception("ConsumerNumber: {consumerNumber} | Random custom error");
 
-            redis.StringSet(key: message.Item1.ToString(), value: true);
+            redis.StringSet(key: message.Id.ToString(), value: true);
         }
     }
 }
