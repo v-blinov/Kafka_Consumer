@@ -1,5 +1,4 @@
-using System.Collections.Immutable;
-using System.Text.Json;
+﻿using System.Runtime.CompilerServices;
 using Confluent.Kafka;
 using SomeService.Models;
 using StackExchange.Redis;
@@ -18,18 +17,18 @@ public static class Program
     private static readonly ConsumerConfig ConsumerConfig = new()
     {
         BootstrapServers = KafkaHost, 
-        GroupId = "Group_3", 
+        GroupId = "Group_6", 
         AutoOffsetReset = AutoOffsetReset.Earliest, 
         EnableAutoCommit = false
     };
 
-    private static readonly TimeSpan ProducerDelay = TimeSpan.FromMilliseconds(300);
-    
-    private static readonly int MessagesBatchMaxSize = 6;
+    private const int MessagesBatchMaxSize = 6;
     private static readonly TimeSpan LingerMs = TimeSpan.FromSeconds(10);
 
+    private static readonly TimeSpan ProducerDelay = TimeSpan.FromMilliseconds(300);
     private static readonly TimeSpan ConsumerTimeout = TimeSpan.FromMilliseconds(100);
-    private static readonly TimeSpan FailDelay = TimeSpan.FromMilliseconds(500);
+
+    private delegate IEnumerable<TopicPartitionOffset> ProcessMessageDelegate<TKey, TValue>(IReadOnlyCollection<KafkaMessageWrap<TKey, TValue>> messages, int consumerNumber, CancellationToken cancellationToken);
 
     private static readonly Random Random = new();
 
@@ -41,15 +40,16 @@ public static class Program
 
         // await ProduceMessages(cancellationToken);
         
-        var consumer1Task = Task.Run(async () => await ConsumeMessages(1, cancellationToken));
-        var consumer2Task = Task.Run(async () => await ConsumeMessages(2, cancellationToken));
-        var consumer3Task = Task.Run(async () => await ConsumeMessages(3, cancellationToken));
-
-        await Task.WhenAll(consumer1Task, consumer2Task, consumer3Task);
+        // await Task.Run(async () => await ConsumeMessages(1, ProcessMessage, cancellationToken), cancellationToken);
+        var consumer1Task = Task.Run(async () => await ConsumeMessages(1, ProcessMessage, cancellationToken), cancellationToken);
+        var consumer2Task = Task.Run(async () => await ConsumeMessages(2, ProcessMessage, cancellationToken), cancellationToken);
+        var consumer3Task = Task.Run(async () => await ConsumeMessages(3, ProcessMessage, cancellationToken), cancellationToken);
+        
+        await Task.WhenAll(consumer1Task, consumer2Task, consumer3Task).ConfigureAwait(false);
         Console.ReadLine();
     }
 
-    public static async Task ProduceMessages(CancellationToken cancellationToken)
+    private static async Task ProduceMessages(CancellationToken cancellationToken)
     {
         var rand = new Random();
         
@@ -89,7 +89,7 @@ public static class Program
         }
     }
     
-    private static async Task ConsumeMessages(int consumerNumber, CancellationToken cancellationToken)
+    private static async Task ConsumeMessages(int consumerNumber, ProcessMessageDelegate<string, Person> processMessage, CancellationToken cancellationToken)
     {
         var redis = await ConnectionMultiplexer.ConnectAsync(RedisHost);
         var redisDb = redis.GetDatabase();
@@ -100,80 +100,152 @@ public static class Program
 
         consumer.Subscribe(PersonTopic);
 
-        var lastProcessedIsSuccessfully = true;
-        Queue<KafkaMessageWrap<string, Person>> messages = new();
-        var deadline = DateTime.UtcNow.Add(LingerMs);
-            
+        var lastConsumeBatchIsSuccessfully = true;
+        IReadOnlyCollection<KafkaMessageWrap<string, Person>> messages = new List<KafkaMessageWrap<string, Person>>();
+
         while(!cancellationToken.IsCancellationRequested)
         {
-            if(DateTime.UtcNow >= deadline && messages.Any() || messages.Count >= MessagesBatchMaxSize)
-            {
-                try
-                {
-                    ProcessMessage(messages.ToImmutableArray(), redisDb, consumerNumber);
-                
-                    consumer.Commit(messages.Select(p => p.Id));
-                        
-                    messages.Clear();
-                    deadline = DateTime.UtcNow.Add(LingerMs);
-                }
-                catch(Exception ex)
-                {
-                    Console.WriteLine($"[Error] ::: ConsumerNumber: {consumerNumber} | Batch processing message failure. BatchMessageFirst:{messages.First().Id}, BatchMessageLast:{messages.Last().Id}. Error: {ex.Message}");
-                    await Task.Delay(FailDelay);
-                    continue;
-                }
-            }
-            
-            ConsumeResult<string, Person> message = null;
-            if (lastProcessedIsSuccessfully) 
-                message = consumer.Consume(ConsumerTimeout);
-
             try
             {
-                if(message != null)
+                if(lastConsumeBatchIsSuccessfully)
                 {
-                    messages.Enqueue(new KafkaMessageWrap<string, Person>
-                    {
-                        Id = message.TopicPartitionOffset, 
-                        Message = message.Message
-                    });
-                    
-                    Console.WriteLine($"[Info] --> ConsumerNumber: {consumerNumber} | Consume {message.TopicPartitionOffset} => key : {message.Message.Key}, value: {{ {message.Message.Value.Name} : {message.Message.Value.Age} }} => InBatchPosition: {messages.Count}");
-
-                    lastProcessedIsSuccessfully = true;
+                    // Принять пачку сообщений из топика
+                    messages = consumer.ConsumeBatch(cancellationToken);
+                    if(!messages.Any())
+                        continue;
                 }
+
+                // Выбрать еще не обработанные
+                var redisKeys = messages.Select(p => new MessageRedisKey { ConsumerGroupId = consumer.MemberId, TopicPartitionOffset = p.Id });
+                var unprocessedMessageKeys = FilterUnprocessedMessages(redisDb, redisKeys);
+
+                // Обработать
+                var unprocessedMessages = messages.Where(p => unprocessedMessageKeys.Contains(p.Id)).ToArray();
+                var successfulProcessed = processMessage(unprocessedMessages, consumerNumber, cancellationToken);
+
+                // Сохранить в redis свеже-обработанные
+                var freshProcessedRedisKeys = successfulProcessed.Select(p => new MessageRedisKey { ConsumerGroupId = consumer.MemberId, TopicPartitionOffset = p });
+                SetProcessedMessageKeys(redisDb, freshProcessedRedisKeys);
+
+                if(successfulProcessed.Count() == unprocessedMessageKeys.Count())   //TODO: по-другому отслеживать наличие ошибок
+                {
+                    // Если все прошло без ошибок, зафиксировать offset
+                    consumer.Commit(messages.Select(p => p.Id).ToArray());
+                    lastConsumeBatchIsSuccessfully = true;
+                } 
+                else
+                {
+                    lastConsumeBatchIsSuccessfully = false;
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
             }
             catch(Exception ex)
             {
-                Console.WriteLine($"[Error] ::: ConsumerNumber: {consumerNumber} | consume messages error ({message.Topic}:{message.Partition}:{message.Offset}): {ex.Message}");
-                lastProcessedIsSuccessfully = false;
+                Console.WriteLine($"[Error] : {ex.Message}");
+                lastConsumeBatchIsSuccessfully = false;
             }
-
-            // Для разработки
-            await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
         }
         
         consumer.Close();
     }
 
-    private static void ProcessMessage<TKey, TValue>(IReadOnlyCollection<KafkaMessageWrap<TKey, TValue>> messages, IDatabase redis, int consumerNumber)
+    private static IReadOnlyCollection<KafkaMessageWrap<TKey, TValue>> ConsumeBatch<TKey, TValue>(this IConsumer<TKey, TValue> consumer, CancellationToken cancellationToken)
     {
+        var lastConsumeIsSuccessfully = true;
+        var deadline = DateTime.UtcNow.Add(LingerMs);
+
+        ConsumeResult<TKey, TValue>? message = null;
+        Queue<KafkaMessageWrap<TKey, TValue>> messages = new();
+
+        bool ConfigureBatch(IReadOnlyCollection<KafkaMessageWrap<TKey, TValue>> kafkaMessageWraps, DateTime deadline)
+            => DateTime.UtcNow >= deadline && kafkaMessageWraps.Any() || kafkaMessageWraps.Count >= MessagesBatchMaxSize;
+        
+        while(!cancellationToken.IsCancellationRequested)
+        {
+            if (lastConsumeIsSuccessfully) 
+                message = consumer.Consume(ConsumerTimeout);
+
+            try
+            {
+                if(message is null)
+                    continue;
+
+                messages.Enqueue(new KafkaMessageWrap<TKey, TValue>
+                {
+                    Id = message.TopicPartitionOffset, 
+                    Message = message.Message
+                });
+                
+                lastConsumeIsSuccessfully = true;
+
+                Console.WriteLine($"[Info] --> ConsumerName: {consumer.Name} | Consume {message.TopicPartitionOffset} => key : {message.Message.Key}, value: {{ {message.Message.Value} }} => InBatchPosition: {messages.Count}");
+
+                if(ConfigureBatch(messages, deadline))
+                    break;
+            }
+            catch(Exception ex)
+            {
+                lastConsumeIsSuccessfully = false;
+                Console.WriteLine($"[Error] ::: ConsumerName: {consumer.Name} | consume messages error ({message?.Topic}:{message?.Partition}:{message?.Offset}): {ex.Message}");
+            }
+        }
+        
+        return messages;
+    }
+
+    private static IEnumerable<TopicPartitionOffset> FilterUnprocessedMessages(IDatabase redis, IEnumerable<MessageRedisKey> messageKeys)
+    {
+        var keys = messageKeys.ToArray();
+        var redisKeys = keys.Select(p => (RedisKey)p.ToString()).ToArray();
+        var redisValues = redis.StringGet(redisKeys);
+
+        var unsavedKeys = new List<TopicPartitionOffset>(redisValues.Count(p => !p.HasValue || p.IsNull));
+        
+        for(var i = 0; i < redisKeys.Length; i++)
+        {
+            if (!redisValues[i].HasValue || redisValues[i].IsNull)
+                unsavedKeys.Add(keys[i].TopicPartitionOffset);
+            else
+                Console.WriteLine($"[INFO] --> redis already has TopicPartitionOffset: {keys[i].TopicPartitionOffset} => this message is processed already.");
+        }
+
+        return unsavedKeys;
+    }
+
+    private static void SetProcessedMessageKeys(IDatabase redis, IEnumerable<MessageRedisKey> freshProcessedRedisKeys)
+    {
+        var keys = freshProcessedRedisKeys.ToArray();
+        var redisKeys = keys.Select(p => new KeyValuePair<RedisKey,RedisValue>((RedisKey)p.ToString(), true)).ToArray();
+        
+        redis.StringSet(redisKeys);
+    }
+
+    private static IEnumerable<TopicPartitionOffset> ProcessMessage<TKey, TValue>(IReadOnlyCollection<KafkaMessageWrap<TKey, TValue>> messages, int consumerNumber, CancellationToken cancellationToken)
+    {
+        var successfulProcessed = new List<TopicPartitionOffset>();
+        
         foreach(var message in messages)
         {
-            var redisValue = redis.StringGet(message.Id.ToString());
-            if(!redisValue.IsNullOrEmpty)
+            if(cancellationToken.IsCancellationRequested)
+                return successfulProcessed;
+
+            try
             {
-                Console.WriteLine($"[INFO] --> ConsumerNumber: {consumerNumber} | redis already has TopicPartitionOffset: {message.Id} => this message is processed already.");
-                continue;
+                // Processing logic
+                
+                if(Random.Next(10) % 9 == 0)
+                    throw new Exception($"ConsumerNumber: {consumerNumber} | Random custom error");
+                
+                Console.WriteLine($"[Info] --> ConsumerNumber: {consumerNumber} | Success process {message.Id.ToString()}");
+                successfulProcessed.Add(message.Id);
             }
-
-            // Processing logic
-            Console.WriteLine($"[Info] --> ConsumerNumber: {consumerNumber} | process {message.Id.ToString()}");
-            if(Random.Next(10) % 9 == 0)
-                throw new Exception("ConsumerNumber: {consumerNumber} | Random custom error");
-
-            redis.StringSet(key: message.Id.ToString(), value: true);
+            catch(Exception ex)
+            {   
+                Console.WriteLine($"[Error] --> ConsumerNumber: {consumerNumber} | Error process {message.Id.ToString()} | ({ex.Message})");
+            }
         }
+
+        return successfulProcessed;
     }
 }
