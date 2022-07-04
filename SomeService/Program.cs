@@ -32,21 +32,6 @@ public static class Program
     private static readonly TimeSpan FailDelay = TimeSpan.FromMilliseconds(500);
 
     private static readonly Random Random = new();
-    
-    
-    private class Person
-    {
-        public string Name { get; set; }
-        public int Age { get; set; }
-    }
-    private class CustomKafkaSerializer<T> : ISerializer<T>, IDeserializer<T>
-    {
-        public T Deserialize(ReadOnlySpan<byte> data, bool isNull, SerializationContext context) 
-            => JsonSerializer.Deserialize<T>(data);
-
-        public byte[] Serialize(T data, SerializationContext context) 
-            => JsonSerializer.SerializeToUtf8Bytes(data);
-    }
 
     
     public static async Task Main()
